@@ -58,6 +58,14 @@ async def render_and_upload(request: RenderRequest):
             text=True
         )
 
+        # Log the Manim output for debugging
+        print("=== Manim STDOUT ===")
+        print(result.stdout)
+        print("=== Manim STDERR ===")
+        print(result.stderr)
+        print("=== Return Code ===")
+        print(result.returncode)
+
         if result.returncode != 0:
             raise HTTPException(status_code=500, detail=f"Render failed: {result.stderr}")
 
@@ -86,7 +94,20 @@ async def render_and_upload(request: RenderRequest):
                 break
         
         if not output_file or not output_file.exists():
-            raise HTTPException(status_code=500, detail=f"Output file not generated. Checked paths: {[str(p) for p in possible_paths]}")
+            # Check what files actually exist in the media directory
+            media_dir = Path("media")
+            existing_files = []
+            if media_dir.exists():
+                for item in media_dir.rglob("*.mp4"):
+                    existing_files.append(str(item))
+            
+            error_msg = f"Output file not generated. Checked paths: {[str(p) for p in possible_paths]}"
+            if existing_files:
+                error_msg += f"\nFound MP4 files: {existing_files}"
+            else:
+                error_msg += "\nNo MP4 files found in media directory"
+            
+            raise HTTPException(status_code=500, detail=error_msg)
 
         # Upload to Supabase Storage
         bucket_name = "videos"  # Ensure this bucket exists in your Supabase project
