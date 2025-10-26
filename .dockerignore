@@ -34,6 +34,7 @@ media/
 
 # Documentation
 README.md
+LATEX_SUPPORT.md
 
 # Temporary files
 *.log

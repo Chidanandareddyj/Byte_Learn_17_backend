@@ -39,38 +39,27 @@ async def render_and_upload(request: RenderRequest):
     if any(keyword in request.script_code for keyword in unsafe_keywords):
         raise HTTPException(status_code=400, detail="Unsafe code detected")
 
-    # Validate that the script contains the specified scene class
-    if f"class {request.scene_name}" not in request.script_code:
-        raise HTTPException(status_code=400, detail=f"Scene class '{request.scene_name}' not found in script")
+    # Extract all scene class names from the script
+    import re
+    scene_pattern = r'class\s+(\w+)\s*\(\s*Scene\s*\)'
+    scene_matches = re.findall(scene_pattern, request.script_code)
+    
+    if not scene_matches:
+        raise HTTPException(status_code=400, detail="No Scene classes found in script")
+    
+    print(f"Found {len(scene_matches)} scenes: {scene_matches}")
 
     # Write complete Manim script to temp file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as temp_file:
         temp_file.write(request.script_code)
         temp_path = temp_file.name
 
+    rendered_videos = []
+    temp_file_base = Path(temp_path).stem
+    
     try:
-        # Render with Manim
+        # Render each scene individually
         flag = QUALITY_FLAGS.get(request.quality, "-ql")
-        
-        result = subprocess.run(
-            ["manim", flag, temp_path, request.scene_name],
-            capture_output=True,
-            text=True
-        )
-
-        # Log the Manim output for debugging
-        print("=== Manim STDOUT ===")
-        print(result.stdout)
-        print("=== Manim STDERR ===")
-        print(result.stderr)
-        print("=== Return Code ===")
-        print(result.returncode)
-
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Render failed: {result.stderr}")
-
-        # Find the actual output file (Manim creates subdirectories based on temp file name)
-        temp_file_base = Path(temp_path).stem
         quality_folder = {
             "low": "480p15",
             "medium": "720p30", 
@@ -78,52 +67,105 @@ async def render_and_upload(request: RenderRequest):
             "4k": "2160p60"
         }.get(request.quality, "480p15")
         
-        # Search for the output file in the media directory
-        output_file = None
-        media_dir = Path("media")
-        
-        # Check both possible locations
-        possible_paths = [
-            media_dir / "videos" / temp_file_base / quality_folder / f"{request.scene_name}.mp4",
-            media_dir / "media" / "videos" / temp_file_base / quality_folder / f"{request.scene_name}.mp4",
-        ]
-        
-        for path in possible_paths:
-            if path.exists():
-                output_file = path
-                break
-        
-        if not output_file or not output_file.exists():
-            # Check what files actually exist in the media directory
-            media_dir = Path("media")
-            existing_files = []
-            if media_dir.exists():
-                for item in media_dir.rglob("*.mp4"):
-                    existing_files.append(str(item))
+        for scene_name in scene_matches:
+            print(f"Rendering scene: {scene_name}")
             
-            error_msg = f"Output file not generated. Checked paths: {[str(p) for p in possible_paths]}"
-            if existing_files:
-                error_msg += f"\nFound MP4 files: {existing_files}"
-            else:
-                error_msg += "\nNo MP4 files found in media directory"
-            
-            raise HTTPException(status_code=500, detail=error_msg)
-
-        # Upload to Supabase Storage
-        bucket_name = "videos"  # Ensure this bucket exists in your Supabase project
-        file_path = f"{request.scene_name}_{request.quality}.mp4"
-        with open(output_file, "rb") as video_file:
-            # python supabase client doesn't accept 'options' kwarg on upload; content type is inferred
-            upload_result = supabase.storage.from_(bucket_name).upload(
-                file_path, video_file
+            result = subprocess.run(
+                ["manim", flag, temp_path, scene_name],
+                capture_output=True,
+                text=True
             )
 
-        # Basic success check (structure differs by client version)
+            # Log the Manim output for debugging
+            print(f"=== Manim STDOUT for {scene_name} ===")
+            print(result.stdout)
+            print(f"=== Manim STDERR for {scene_name} ===")
+            print(result.stderr)
+            print(f"=== Return Code for {scene_name} ===")
+            print(result.returncode)
+
+            if result.returncode != 0:
+                # Check if it's a LaTeX error
+                error_msg = result.stderr
+                if "LaTeX" in error_msg or "tex" in error_msg.lower():
+                    raise HTTPException(
+                        status_code=500, 
+                        detail=f"LaTeX rendering failed in scene '{scene_name}'. Use Text() instead of Tex() for simple text. Error: {result.stderr[:500]}"
+                    )
+                raise HTTPException(status_code=500, detail=f"Render failed for scene '{scene_name}': {result.stderr[:500]}")
+
+            # Find the rendered video file
+            media_dir = Path("media")
+            possible_paths = [
+                media_dir / "videos" / temp_file_base / quality_folder / f"{scene_name}.mp4",
+                media_dir / "media" / "videos" / temp_file_base / quality_folder / f"{scene_name}.mp4",
+            ]
+            
+            output_file = None
+            for path in possible_paths:
+                if path.exists():
+                    output_file = path
+                    break
+            
+            if not output_file or not output_file.exists():
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Output file not generated for scene '{scene_name}'. Checked: {[str(p) for p in possible_paths]}"
+                )
+            
+            rendered_videos.append(output_file)
+            print(f"Successfully rendered: {output_file}")
+
+        # Concatenate all videos into one using ffmpeg
+        if len(rendered_videos) == 1:
+            # Only one video, no need to concatenate
+            final_video = rendered_videos[0]
+        else:
+            # Create a temporary file list for ffmpeg concat
+            concat_list_path = Path("media") / f"{temp_file_base}_concat.txt"
+            with open(concat_list_path, "w") as f:
+                for video in rendered_videos:
+                    f.write(f"file '{video.absolute()}'\n")
+            
+            # Output path for concatenated video
+            final_video = Path("media") / "videos" / temp_file_base / quality_folder / "final_output.mp4"
+            final_video.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Concatenate videos using ffmpeg
+            concat_result = subprocess.run(
+                ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list_path), 
+                 "-c", "copy", str(final_video)],
+                capture_output=True,
+                text=True
+            )
+            
+            if concat_result.returncode != 0:
+                print(f"FFmpeg concatenation error: {concat_result.stderr}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to concatenate videos: {concat_result.stderr[:500]}"
+                )
+            
+            # Clean up concat list file
+            concat_list_path.unlink()
+            print(f"Successfully concatenated {len(rendered_videos)} videos into: {final_video}")
+
+        # Upload the final video to Supabase Storage
+        bucket_name = "videos"
+        timestamp = int(Path(temp_path).stem.replace("tmp", "")[-8:], 36) if "tmp" in temp_path else ""
+        file_path = f"manim_{timestamp}_{request.quality}.mp4"
+        
+        with open(final_video, "rb") as video_file:
+            upload_result = supabase.storage.from_(bucket_name).upload(
+                file_path, video_file, {"upsert": "true"}
+            )
+
+        # Basic success check
         upload_data = getattr(upload_result, "data", upload_result)
         if not upload_data:
             raise HTTPException(status_code=500, detail="Upload failed")
 
-        # Get public URL (structure differs by client version)
+        # Get public URL
         public_res = supabase.storage.from_(bucket_name).get_public_url(file_path)
         public_data = getattr(public_res, "data", public_res)
         if isinstance(public_data, dict):
@@ -133,12 +175,18 @@ async def render_and_upload(request: RenderRequest):
         if not public_url:
             raise HTTPException(status_code=500, detail="Could not obtain public URL from Supabase")
 
-        # Clean up: Delete the rendered video file and its directory
+        # Clean up: Delete all rendered videos and directories
         try:
-            output_file.unlink()  # Delete the video file
+            # Delete individual scene videos
+            for video in rendered_videos:
+                if video.exists():
+                    video.unlink()
+            
+            # Delete final video if it's different from individual videos
+            if final_video not in rendered_videos and final_video.exists():
+                final_video.unlink()
             
             # Delete the entire temp directory created by Manim
-            temp_file_base = Path(temp_path).stem
             media_dir = Path("media")
             
             # Clean up videos directory
@@ -167,7 +215,8 @@ async def render_and_upload(request: RenderRequest):
         return {
             "success": True,
             "video_url": public_url,
-            "message": f"Rendered and uploaded: {file_path}"
+            "message": f"Rendered and uploaded {len(scene_matches)} scenes: {file_path}",
+            "scenes_rendered": len(scene_matches)
         }
 
     finally:

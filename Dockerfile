@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     libpango1.0-dev \
     texlive-latex-base \
     texlive-fonts-recommended \
+    texlive-latex-recommended \
     cm-super \
     dvipng \
     wget \
