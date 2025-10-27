@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
+import requests
+from moviepy import VideoFileClip, AudioFileClip
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,6 +25,12 @@ class RenderRequest(BaseModel):
     script_code: str  # Complete Manim script with scene class definition
     scene_name: str  # Name of the scene class to render
     quality: str = "low"  # low, medium, high, 4k
+
+class MuxRequest(BaseModel):
+    video_url: str  # Supabase video URL
+    audio_url: str  # Supabase audio URL
+    output_name: str = "combined_video"  # e.g., "scene1_muxed.mp4"
+    bucket_name: str = "muxvideos"  # Your bucket
 
 # Map quality to Manim flags
 QUALITY_FLAGS = {
@@ -49,8 +57,8 @@ async def render_and_upload(request: RenderRequest):
     
     print(f"Found {len(scene_matches)} scenes: {scene_matches}")
 
-    # Write complete Manim script to temp file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as temp_file:
+    # Write complete Manim script to temp file with UTF-8 encoding for Unicode symbols
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as temp_file:
         temp_file.write(request.script_code)
         temp_path = temp_file.name
 
@@ -223,6 +231,122 @@ async def render_and_upload(request: RenderRequest):
         # Clean up temp script
         os.unlink(temp_path)
 
+@app.post("/mux-audio-video")
+async def mux_audio_video(request: MuxRequest):
+    video_clip = None
+    audio_clip = None
+    final_clip = None
+    
+    # Download files to temp
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            temp_path = Path(temp_dir)
+            
+            # Download video
+            video_path = temp_path / "input_video.mp4"
+            video_resp = requests.get(request.video_url, timeout=30)
+            if video_resp.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"Failed to download video: {video_resp.status_code}")
+            with open(video_path, "wb") as f:
+                f.write(video_resp.content)
+            
+            # Download audio
+            audio_path = temp_path / "input_audio.mp3"
+            audio_resp = requests.get(request.audio_url, timeout=30)
+            if audio_resp.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"Failed to download audio: {audio_resp.status_code}")
+            with open(audio_path, "wb") as f:
+                f.write(audio_resp.content)
+            
+            # Load with MoviePy
+            video_clip = VideoFileClip(str(video_path))
+            audio_clip = AudioFileClip(str(audio_path))
+            
+            # Get durations
+            video_duration = video_clip.duration
+            audio_duration = audio_clip.duration
+            
+            # Mux: Handle different audio/video length scenarios
+            if audio_duration > video_duration:
+                # Audio is longer - trim audio to video length
+                audio_clip = audio_clip.subclipped(0, video_duration)
+            elif audio_duration < video_duration:
+                # Audio is shorter - you might want to loop audio or just use what's available
+                # For now, we'll just use the available audio (video will be silent after audio ends)
+                pass
+            
+            final_clip = video_clip.with_audio(audio_clip)
+            
+            # Export to temp output
+            output_path = temp_path / f"{request.output_name}.mp4"
+            final_clip.write_videofile(
+                str(output_path), 
+                codec="libx264", 
+                audio_codec="aac",
+                temp_audiofile=str(temp_path / "temp-audio.m4a"),
+                remove_temp=True,
+                logger=None  # Suppress moviepy progress bars in logs
+            )
+            
+            # Close clips to free resources BEFORE uploading
+            try:
+                if final_clip:
+                    final_clip.close()
+                if audio_clip:
+                    audio_clip.close()
+                if video_clip:
+                    video_clip.close()
+            except Exception as close_error:
+                print(f"Warning: Error closing clips: {close_error}")
+            
+            # Upload to Supabase
+            file_name = f"{request.output_name}.mp4"
+            with open(output_path, "rb") as output_file:
+                upload_result = supabase.storage.from_(request.bucket_name).upload(
+                    file_name, 
+                    output_file,
+                    {"contentType": "video/mp4", "upsert": "true"}
+                )
+            
+            # Check upload success
+            upload_data = getattr(upload_result, "data", upload_result)
+            if not upload_data:
+                raise HTTPException(status_code=500, detail="Upload to Supabase failed")
+            
+            # Get public URL (using same pattern as render-and-upload endpoint)
+            public_res = supabase.storage.from_(request.bucket_name).get_public_url(file_name)
+            public_data = getattr(public_res, "data", public_res)
+            if isinstance(public_data, dict):
+                public_url = public_data.get("publicUrl") or public_data.get("public_url") or public_data.get("signedUrl")
+            else:
+                public_url = str(public_data)
+            
+            if not public_url:
+                raise HTTPException(status_code=500, detail="Could not obtain public URL from Supabase")
+            
+            return {
+                "success": True,
+                "combined_url": public_url,
+                "video_duration": video_duration,
+                "audio_duration": audio_duration,
+                "message": "Audio and video muxed successfully"
+            }
+        
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Muxing failed: {str(e)}")
+        finally:
+            # Ensure all clips are closed even if an error occurs
+            try:
+                if final_clip:
+                    final_clip.close()
+                if audio_clip:
+                    audio_clip.close()
+                if video_clip:
+                    video_clip.close()
+            except Exception as cleanup_error:
+                print(f"Warning: Failed to close video clips: {cleanup_error}")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
