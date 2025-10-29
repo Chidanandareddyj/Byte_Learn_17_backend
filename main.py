@@ -250,8 +250,11 @@ async def mux_audio_video(request: MuxRequest):
             with open(video_path, "wb") as f:
                 f.write(video_resp.content)
             
-            # Download audio
-            audio_path = temp_path / "input_audio.mp3"
+            # Download audio - detect extension from URL
+            audio_extension = request.audio_url.split('.')[-1].split('?')[0]  # Extract extension, remove query params
+            if audio_extension not in ['mp3', 'wav', 'm4a', 'aac']:
+                audio_extension = 'mp3'  # Default fallback
+            audio_path = temp_path / f"input_audio.{audio_extension}"
             audio_resp = requests.get(request.audio_url, timeout=30)
             if audio_resp.status_code != 200:
                 raise HTTPException(status_code=400, detail=f"Failed to download audio: {audio_resp.status_code}")
@@ -259,8 +262,14 @@ async def mux_audio_video(request: MuxRequest):
                 f.write(audio_resp.content)
             
             # Load with MoviePy
-            video_clip = VideoFileClip(str(video_path))
-            audio_clip = AudioFileClip(str(audio_path))
+            try:
+                video_clip = VideoFileClip(str(video_path))
+                audio_clip = AudioFileClip(str(audio_path))
+            except Exception as load_error:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Failed to load media files: {str(load_error)}. Audio file: {audio_path.name}"
+                )
             
             # Get durations
             video_duration = video_clip.duration
@@ -283,6 +292,7 @@ async def mux_audio_video(request: MuxRequest):
                 str(output_path), 
                 codec="libx264", 
                 audio_codec="aac",
+                audio_bitrate="192k",  # Explicitly set audio bitrate
                 temp_audiofile=str(temp_path / "temp-audio.m4a"),
                 remove_temp=True,
                 logger=None  # Suppress moviepy progress bars in logs
