@@ -31,6 +31,7 @@ class MuxRequest(BaseModel):
     audio_url: str  # Supabase audio URL
     output_name: str = "combined_video"  # e.g., "scene1_muxed.mp4"
     bucket_name: str = "muxvideos"  # Your bucket
+    audio_speed: float = 1.3  # Speed multiplier for audio (1.0 = normal, 1.3 = 30% faster)
 
 # Map quality to Manim flags
 QUALITY_FLAGS = {
@@ -78,11 +79,18 @@ async def render_and_upload(request: RenderRequest):
         for scene_name in scene_matches:
             print(f"Rendering scene: {scene_name}")
             
-            result = subprocess.run(
-                ["manim", flag, temp_path, scene_name],
-                capture_output=True,
-                text=True
-            )
+            try:
+                result = subprocess.run(
+                    ["manim", flag, temp_path, scene_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minute timeout per scene for longer animations
+                )
+            except subprocess.TimeoutExpired:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Scene '{scene_name}' timed out after 300 seconds. The scene likely contains an infinite loop, excessive computations, or animations that take too long. Simplify the scene animations and reduce complexity."
+                )
 
             # Log the Manim output for debugging
             print(f"=== Manim STDOUT for {scene_name} ===")
@@ -270,6 +278,42 @@ async def mux_audio_video(request: MuxRequest):
                     status_code=400, 
                     detail=f"Failed to load media files: {str(load_error)}. Audio file: {audio_path.name}"
                 )
+            
+            # Speed up audio if requested (using ffmpeg via subprocess for better quality)
+            if request.audio_speed != 1.0:
+                print(f"Speeding up audio by {request.audio_speed}x")
+                sped_audio_path = temp_path / f"sped_audio.{audio_extension}"
+                
+                # Use ffmpeg atempo filter for audio speed adjustment
+                # atempo can only go from 0.5 to 2.0, so we may need to chain filters
+                speed = request.audio_speed
+                atempo_filters = []
+                
+                while speed > 2.0:
+                    atempo_filters.append("atempo=2.0")
+                    speed /= 2.0
+                while speed < 0.5:
+                    atempo_filters.append("atempo=0.5")
+                    speed /= 0.5
+                
+                atempo_filters.append(f"atempo={speed}")
+                filter_str = ",".join(atempo_filters)
+                
+                ffmpeg_cmd = [
+                    "ffmpeg", "-i", str(audio_path),
+                    "-filter:a", filter_str,
+                    "-y",  # Overwrite output
+                    str(sped_audio_path)
+                ]
+                
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"Warning: Failed to speed up audio: {result.stderr}")
+                    # Continue with original audio if speed adjustment fails
+                else:
+                    # Close original audio and load the sped-up version
+                    audio_clip.close()
+                    audio_clip = AudioFileClip(str(sped_audio_path))
             
             # Get durations
             video_duration = video_clip.duration
