@@ -1,3 +1,7 @@
+import asyncio
+import threading
+from uuid import uuid4
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -33,6 +37,20 @@ class MuxRequest(BaseModel):
     bucket_name: str = "muxvideos"  # Your bucket
     audio_speed: float = 1.3  # Speed multiplier for audio (1.0 = normal, 1.3 = 30% faster)
 
+
+class AsyncRenderRequest(RenderRequest):
+    prompt_id: str
+    prompt_record_id: str
+    script_id: str
+    video_record_id: str
+    mux_record_id: str
+    audio_url: str
+    callback_url: str
+    callback_secret: str | None = None
+    output_name: str | None = None
+    bucket_name: str = "muxvideos"
+    audio_speed: float = 1.0
+
 # Map quality to Manim flags
 QUALITY_FLAGS = {
     "low": "-ql",
@@ -40,6 +58,112 @@ QUALITY_FLAGS = {
     "high": "-qh",
     "4k": "-qk",
 }
+
+
+def deliver_callback(url: str, payload: dict, secret: str | None) -> None:
+    if not url:
+        print("[CALLBACK] No callback URL provided; skipping notification")
+        return
+
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Callback-Secret"] = secret
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
+        response.raise_for_status()
+        print(f"[CALLBACK] Delivered job {payload.get('jobId')} update with status {payload.get('status')}")
+    except Exception as error:
+        print(f"[CALLBACK] Failed to deliver webhook: {error}")
+
+
+def process_render_and_mux_job(job_id: str, payload: dict) -> None:
+    async_request = AsyncRenderRequest(**payload)
+    callback_payload: dict[str, object] = {
+        "jobId": job_id,
+        "promptId": async_request.prompt_id,
+        "videoRecordId": async_request.video_record_id,
+        "muxRecordId": async_request.mux_record_id,
+        "status": "PROCESSING",
+    }
+
+    try:
+        render_request = RenderRequest(
+            script_code=async_request.script_code,
+            scene_name=async_request.scene_name,
+            quality=async_request.quality,
+        )
+
+        render_result = asyncio.run(render_and_upload(render_request))
+        video_url = render_result.get("video_url")
+        callback_payload["videoUrl"] = video_url
+        callback_payload["message"] = render_result.get("message")
+
+        if not isinstance(video_url, str):
+            raise RuntimeError("Render job did not return a video URL")
+
+        mux_request = MuxRequest(
+            video_url=video_url,
+            audio_url=async_request.audio_url,
+            output_name=async_request.output_name or f"final_{job_id}",
+            bucket_name=async_request.bucket_name,
+            audio_speed=async_request.audio_speed,
+        )
+
+        mux_result = asyncio.run(mux_audio_video(mux_request))
+        final_video_url = mux_result.get("combined_url") or mux_result.get("video_url")
+
+        if not isinstance(final_video_url, str):
+            raise RuntimeError("Mux job did not return a final video URL")
+
+        callback_payload.update(
+            {
+                "status": "COMPLETED",
+                "finalVideoUrl": final_video_url,
+                "muxMessage": mux_result.get("message"),
+            }
+        )
+    except HTTPException as http_error:
+        callback_payload.update(
+            {
+                "status": "FAILED",
+                "error": http_error.detail,
+            }
+        )
+        print(f"[QUEUE] Job {job_id} failed with HTTPException: {http_error.detail}")
+    except Exception as error:
+        callback_payload.update(
+            {
+                "status": "FAILED",
+                "error": str(error),
+            }
+        )
+        print(f"[QUEUE] Job {job_id} failed with error: {error}")
+    finally:
+        deliver_callback(async_request.callback_url, callback_payload, async_request.callback_secret)
+
+
+@app.post("/render-and-upload-async")
+async def render_and_upload_async(request: AsyncRenderRequest):
+    expected_secret = os.getenv("VIDEO_WEBHOOK_SECRET")
+    if expected_secret:
+        if not request.callback_secret or request.callback_secret != expected_secret:
+            raise HTTPException(status_code=401, detail="Invalid callback secret")
+
+    job_id = uuid4().hex
+    payload = request.model_dump()
+
+    worker = threading.Thread(
+        target=process_render_and_mux_job,
+        args=(job_id, payload),
+        daemon=True,
+    )
+    worker.start()
+
+    print(f"[QUEUE] Scheduled job {job_id} for prompt {request.prompt_id}")
+
+    return {"status": "queued", "job_id": job_id}
+
 
 @app.post("/render-and-upload")
 async def render_and_upload(request: RenderRequest):
