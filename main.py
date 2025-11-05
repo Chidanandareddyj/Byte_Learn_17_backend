@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 import requests
 from moviepy import VideoFileClip, AudioFileClip
 
+LENGTH_TOLERANCE_SECONDS = 0.25
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -402,56 +404,106 @@ async def mux_audio_video(request: MuxRequest):
                     status_code=400, 
                     detail=f"Failed to load media files: {str(load_error)}. Audio file: {audio_path.name}"
                 )
-            
-            # Speed up audio if requested (using ffmpeg via subprocess for better quality)
+
+            # Optionally apply user-provided audio speed multiplier before syncing
             if request.audio_speed != 1.0:
-                print(f"Speeding up audio by {request.audio_speed}x")
+                print(f"Speeding up audio by {request.audio_speed}x (pre-sync)")
                 sped_audio_path = temp_path / f"sped_audio.{audio_extension}"
-                
-                # Use ffmpeg atempo filter for audio speed adjustment
-                # atempo can only go from 0.5 to 2.0, so we may need to chain filters
+
                 speed = request.audio_speed
                 atempo_filters = []
-                
+
                 while speed > 2.0:
                     atempo_filters.append("atempo=2.0")
                     speed /= 2.0
                 while speed < 0.5:
                     atempo_filters.append("atempo=0.5")
                     speed /= 0.5
-                
+
                 atempo_filters.append(f"atempo={speed}")
                 filter_str = ",".join(atempo_filters)
-                
+
                 ffmpeg_cmd = [
                     "ffmpeg", "-i", str(audio_path),
                     "-filter:a", filter_str,
-                    "-y",  # Overwrite output
+                    "-y",
                     str(sped_audio_path)
                 ]
-                
+
                 result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
-                    print(f"Warning: Failed to speed up audio: {result.stderr}")
-                    # Continue with original audio if speed adjustment fails
+                    print(f"Warning: Failed to apply requested audio speed: {result.stderr}")
                 else:
-                    # Close original audio and load the sped-up version
                     audio_clip.close()
                     audio_clip = AudioFileClip(str(sped_audio_path))
-            
+                    audio_path = sped_audio_path
+
             # Get durations
             video_duration = video_clip.duration
             audio_duration = audio_clip.duration
-            
-            # Mux: Handle different audio/video length scenarios
-            if audio_duration > video_duration:
-                # Audio is longer - trim audio to video length
-                audio_clip = audio_clip.subclipped(0, video_duration)
-            elif audio_duration < video_duration:
-                # Audio is shorter - you might want to loop audio or just use what's available
-                # For now, we'll just use the available audio (video will be silent after audio ends)
-                pass
-            
+
+            # If audio is significantly longer than the video, slow the video down to match
+            if audio_duration - video_duration > LENGTH_TOLERANCE_SECONDS:
+                stretch_ratio = audio_duration / video_duration
+                stretched_video_path = temp_path / "stretched_video.mp4"
+                print(
+                    f"Stretching video from {video_duration:.2f}s to match audio {audio_duration:.2f}s (ratio {stretch_ratio:.3f})"
+                )
+
+                # Close clip handles before rewriting the file
+                video_clip.close()
+
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-i",
+                    str(video_path),
+                    "-filter:v",
+                    f"setpts={stretch_ratio}*PTS",
+                    "-an",
+                    "-y",
+                    str(stretched_video_path),
+                ]
+
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to stretch video: {result.stderr[:500]}"
+                    )
+
+                video_path = stretched_video_path
+                video_clip = VideoFileClip(str(video_path))
+                video_duration = video_clip.duration
+
+            # If audio is materially shorter than the video, add silence to reach full duration
+            if video_duration - audio_duration > LENGTH_TOLERANCE_SECONDS:
+                padded_audio_path = temp_path / f"padded_audio.{audio_extension}"
+                print(
+                    f"Padding audio from {audio_duration:.2f}s to match video {video_duration:.2f}s"
+                )
+
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-i",
+                    str(audio_path),
+                    "-filter_complex",
+                    f"[0:a]apad=pad_dur={video_duration - audio_duration}[a];[a]atrim=duration={video_duration}",
+                    "-y",
+                    str(padded_audio_path),
+                ]
+
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to pad audio: {result.stderr[:500]}"
+                    )
+
+                audio_clip.close()
+                audio_clip = AudioFileClip(str(padded_audio_path))
+                audio_path = padded_audio_path
+                audio_duration = audio_clip.duration
+
             final_clip = video_clip.with_audio(audio_clip)
             
             # Export to temp output
