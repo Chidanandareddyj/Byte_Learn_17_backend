@@ -37,8 +37,15 @@ RUN chmod +x entrypoint.sh
 # Create media directory for Manim outputs
 RUN mkdir -p /app/media
 
+# Create job queue directory for persistent job storage
+RUN mkdir -p /app/job_queue
+
 # Expose port (will be set by Sevalla via PORT env var)
 EXPOSE 8000
+
+# Add healthcheck with longer timeout for rendering jobs
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=5 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8000}/health').read()" || exit 1
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

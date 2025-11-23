@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -14,6 +15,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import requests
 from moviepy import VideoFileClip, AudioFileClip
+import job_queue
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,8 +29,16 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Manim API with Supabase",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "active_jobs": len(active_jobs),
+        "jobs": list(active_jobs.keys())
     }
+
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    if job_id in active_jobs:
+        return active_jobs[job_id]
+    return {"status": "not_found"}
 
 # Supabase config (use env vars in prod)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -154,7 +164,13 @@ def deliver_callback(url: str, payload: dict, secret: str | None) -> None:
         print(f"[CALLBACK] Failed to deliver webhook: {error}")
 
 
+# Global dict to track active jobs (to prevent loss on restart)
+active_jobs = {}
+
 def process_render_and_mux_job(job_id: str, payload: dict) -> None:
+    active_jobs[job_id] = {"status": "PROCESSING", "started_at": time.time()}
+    job_queue.update_job_status(job_id, "processing")
+    
     async_request = AsyncRenderRequest(**payload)
     callback_payload: dict[str, object] = {
         "jobId": job_id,
@@ -217,6 +233,10 @@ def process_render_and_mux_job(job_id: str, payload: dict) -> None:
         )
         print(f"[QUEUE] Job {job_id} failed with error: {error}")
     finally:
+        # Remove from active jobs and delete from persistent queue
+        if job_id in active_jobs:
+            del active_jobs[job_id]
+        job_queue.delete_job(job_id)
         deliver_callback(async_request.callback_url, callback_payload, async_request.callback_secret)
 
 
@@ -230,10 +250,14 @@ async def render_and_upload_async(request: AsyncRenderRequest):
     job_id = uuid4().hex
     payload = request.model_dump()
 
+    # Save job to persistent storage
+    job_queue.save_job(job_id, payload)
+
+    # Use non-daemon thread to prevent job loss on container restart
     worker = threading.Thread(
         target=process_render_and_mux_job,
         args=(job_id, payload),
-        daemon=True,
+        daemon=False,  # Keep thread alive even if main process wants to exit
     )
     worker.start()
 
