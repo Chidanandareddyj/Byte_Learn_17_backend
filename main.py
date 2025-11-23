@@ -20,6 +20,16 @@ load_dotenv()
 
 app = FastAPI(title="Manim API with Supabase")
 
+# Health check endpoint
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "Manim API with Supabase",
+        "version": "1.0.0"
+    }
+
 # Supabase config (use env vars in prod)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # Changed from SUPABASE_ANON_KEY to match .env file
@@ -597,4 +607,5 @@ async def mux_audio_video(request: MuxRequest):
                 print(f"Warning: Failed to close video clips: {cleanup_error}")
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
