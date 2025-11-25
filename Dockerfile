@@ -5,7 +5,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies required for Manim
-# Using minimal LaTeX installation to save space
+# Using full LaTeX installation for better rendering support
 RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
@@ -14,11 +14,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libcairo2-dev \
     libpango1.0-dev \
-    texlive-latex-base \
-    texlive-fonts-recommended \
-    texlive-latex-recommended \
-    cm-super \
-    dvipng \
+    texlive-full \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
