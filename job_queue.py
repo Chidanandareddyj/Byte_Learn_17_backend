@@ -7,22 +7,20 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, Any
-import fcntl
 
-QUEUE_DIR = Path("/app/job_queue")
+# Cross-platform queue directory (works on Windows and Linux)
+QUEUE_DIR = Path(os.getenv("JOB_QUEUE_DIR", "job_queue"))
 QUEUE_DIR.mkdir(exist_ok=True)
 
 def save_job(job_id: str, payload: Dict[str, Any]) -> None:
     """Save a job to persistent storage"""
     job_file = QUEUE_DIR / f"{job_id}.json"
     with open(job_file, 'w') as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         json.dump({
             "job_id": job_id,
             "status": "queued",
             "payload": payload
         }, f)
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 def update_job_status(job_id: str, status: str, **kwargs) -> None:
     """Update job status"""
@@ -31,14 +29,12 @@ def update_job_status(job_id: str, status: str, **kwargs) -> None:
         return
     
     with open(job_file, 'r+') as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         data = json.load(f)
         data['status'] = status
         data.update(kwargs)
         f.seek(0)
         json.dump(data, f)
         f.truncate()
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 def delete_job(job_id: str) -> None:
     """Delete a completed job"""

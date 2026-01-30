@@ -13,5 +13,6 @@ echo "SUPABASE_KEY: ${SUPABASE_KEY:+[SET]}${SUPABASE_KEY:-[NOT SET]}"
 echo "VIDEO_WEBHOOK_SECRET: ${VIDEO_WEBHOOK_SECRET:+[SET]}${VIDEO_WEBHOOK_SECRET:-[NOT SET]}"
 echo "========================================="
 
-# Start uvicorn with the PORT from environment
-exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
+# Start uvicorn with the PORT from environment (ensure it's numeric)
+PORT_NUM=${PORT:-8000}
+exec uvicorn main:app --host 0.0.0.0 --port "$PORT_NUM"
